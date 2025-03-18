@@ -2,9 +2,11 @@ import SwiftUI
 
 struct TherapyChatView: View {
     @StateObject private var viewModel = TherapyChatViewModel()
+    @StateObject private var voiceManager = VoiceChatManager()
     @State private var messageText = ""
     @State private var showingCrisisResources = false
     @State private var showingSessionInfo = false
+    @State private var isVoiceModeActive = false
     @FocusState private var isInputFocused: Bool
     
     var body: some View {
@@ -44,6 +46,42 @@ struct TherapyChatView: View {
             .background(Color(.systemBackground))
             .shadow(color: Color.black.opacity(0.05), radius: 5, y: 2)
             
+            // Voice mode indicator
+            if isVoiceModeActive {
+                HStack {
+                    Image(systemName: "mic.fill")
+                        .foregroundColor(.blue)
+                    Text("Voice Mode Active")
+                        .font(.subheadline)
+                        .foregroundColor(.blue)
+                    Spacer()
+                    
+                    // Listening state indicator
+                    if voiceManager.state == .listening {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color.red)
+                                .frame(width: 8, height: 8)
+                            Text("Listening...")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } else if voiceManager.state == .speaking {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 8, height: 8)
+                            Text("Speaking...")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                .background(Color.blue.opacity(0.1))
+            }
+            
             // Chat messages
             ScrollViewReader { scrollView in
                 ScrollView {
@@ -51,36 +89,94 @@ struct TherapyChatView: View {
                         ForEach(viewModel.messages) { message in
                             MessageView(message: message)
                                 .id(message.id)
+                                .onTapGesture {
+                                    // Tap on AI message to have it read aloud
+                                    if !message.isUser && isVoiceModeActive {
+                                        voiceManager.speakText(message.content)
+                                    }
+                                }
                         }
                     }
                     .padding(.horizontal)
                     .padding(.top, 16)
                     .padding(.bottom, 8)
-                }
-                .onChange(of: viewModel.messages.count) { _ in
-                    withAnimation {
-                        scrollView.scrollTo(viewModel.messages.last?.id, anchor: .bottom)
+                    .onChange(of: viewModel.messages.count) { _ in
+                        withAnimation {
+                            scrollView.scrollTo(viewModel.messages.last?.id, anchor: .bottom)
+                            
+                            // Auto-read latest AI message in voice mode
+                            if isVoiceModeActive,
+                               let lastMessage = viewModel.messages.last,
+                               !lastMessage.isUser {
+                                voiceManager.speakText(lastMessage.content)
+                            }
+                        }
                     }
                 }
+            }
+            
+            // Voice transcript (when listening)
+            if voiceManager.state == .listening && !voiceManager.transcript.isEmpty {
+                Text(voiceManager.transcript)
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.systemGray6))
+                    .cornerRadius(12)
+                    .padding(.horizontal)
             }
             
             // Input area
             VStack(spacing: 0) {
                 Divider()
                 HStack(spacing: 12) {
-                    TextField("Type a message...", text: $messageText, axis: .vertical)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .background(Color(.systemGray6))
-                        .cornerRadius(20)
-                        .focused($isInputFocused)
-                    
-                    Button(action: sendMessage) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 32))
-                            .foregroundColor(.blue)
+                    // Text input field
+                    if !isVoiceModeActive {
+                        TextField("Type a message...", text: $messageText, axis: .vertical)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(20)
+                            .focused($isInputFocused)
+                        
+                        Button(action: sendMessage) {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 32))
+                                .foregroundColor(.blue)
+                        }
+                        .disabled(messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    .disabled(messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    
+                    // Voice button
+                    Button(action: toggleVoiceMode) {
+                        Image(systemName: isVoiceModeActive ? "keyboard" : "mic.fill")
+                            .font(.system(size: 24))
+                            .padding(8)
+                            .background(isVoiceModeActive ? Color.blue : Color(.systemGray6))
+                            .foregroundColor(isVoiceModeActive ? .white : .blue)
+                            .clipShape(Circle())
+                    }
+                    
+                    // Voice controls (only shown in voice mode)
+                    if isVoiceModeActive {
+                        Button(action: handleVoiceAction) {
+                            Image(systemName: voiceButtonIcon)
+                                .font(.system(size: 32))
+                                .padding(12)
+                                .background(Color.blue)
+                                .foregroundColor(.white)
+                                .clipShape(Circle())
+                        }
+                        .disabled(!voiceManager.isPermissionGranted)
+                        
+                        Button(action: sendVoiceMessage) {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 32))
+                                .foregroundColor(
+                                    voiceManager.transcript.isEmpty ? .gray : .blue
+                                )
+                        }
+                        .disabled(voiceManager.transcript.isEmpty)
+                    }
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 12)
@@ -93,9 +189,79 @@ struct TherapyChatView: View {
         .sheet(isPresented: $showingSessionInfo) {
             SessionInfoView(sessionNumber: viewModel.sessionNumber)
         }
+        .alert(item: alertItem) { item in
+            Alert(
+                title: Text(item.title),
+                message: Text(item.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
         .onAppear {
             viewModel.startSession()
         }
+        .onDisappear {
+            voiceManager.stopAll()
+        }
+    }
+    
+    private var alertItem: AlertItem? {
+        if let error = voiceManager.errorMessage {
+            return AlertItem(
+                id: UUID().uuidString,
+                title: "Voice Mode Error",
+                message: error
+            )
+        }
+        return nil
+    }
+    
+    private var voiceButtonIcon: String {
+        switch voiceManager.state {
+        case .idle:
+            return "mic.fill"
+        case .listening:
+            return "mic.slash.fill"
+        case .processing:
+            return "arrow.clockwise"
+        case .speaking:
+            return "stop.fill"
+        }
+    }
+    
+    private func toggleVoiceMode() {
+        isVoiceModeActive.toggle()
+        voiceManager.stopAll()
+        
+        // If switching to voice mode and permissions not granted
+        if isVoiceModeActive && !voiceManager.isPermissionGranted {
+            // Show permission alert
+        }
+    }
+    
+    private func handleVoiceAction() {
+        switch voiceManager.state {
+        case .idle:
+            voiceManager.startListening()
+        case .listening:
+            voiceManager.stopListening()
+            // Transcript is saved but not sent yet
+        case .speaking:
+            voiceManager.stopSpeaking()
+        case .processing:
+            // Do nothing while processing
+            break
+        }
+    }
+    
+    private func sendVoiceMessage() {
+        guard !voiceManager.transcript.isEmpty else { return }
+        
+        // Send the transcript as a message
+        viewModel.sendMessage(voiceManager.transcript)
+        
+        // Clear transcript and reset state
+        voiceManager.transcript = ""
+        voiceManager.state = .idle
     }
     
     private func sendMessage() {
@@ -105,6 +271,12 @@ struct TherapyChatView: View {
         messageText = ""
         isInputFocused = false
     }
+}
+
+struct AlertItem: Identifiable {
+    var id: String
+    var title: String
+    var message: String
 }
 
 struct MessageView: View {
@@ -261,6 +433,18 @@ struct SessionInfoView: View {
                                 .font(.body)
                         }
                     }
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                .cornerRadius(12)
+                
+                // Voice Mode Information
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Voice Mode")
+                        .font(.headline)
+                    
+                    Text("Voice mode allows you to speak directly with your AI therapist. Tap the microphone icon to toggle voice mode, then tap it again to start or stop recording. Tap on any therapist message to have it read aloud.")
+                        .font(.body)
                 }
                 .padding()
                 .background(Color(.systemGray6))
